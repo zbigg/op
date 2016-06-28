@@ -1,0 +1,3 @@
+[submodule "bashfoo"]
+	path = bashfoo
+	url = git@github.com:zbigg/bashfoo.git

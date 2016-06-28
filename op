@@ -1,0 +1,526 @@
+#!/usr/bin/env bash
+
+##
+## op - CLI hosting manager
+##
+##   use cases:
+##      create developer/production sites on fly
+##        i.e configure frontend (nginx)
+##        create/init 
+##     FUTURE:
+##        update DNS records via CLI
+##
+## 
+
+set -e
+
+#op_script_dir="$(dirname $BASH_SOURCE)"
+#if [ -f ${op_script_dir}/lib/op-common.sh ] ; then
+#    op_libdir="${op_script_dir}/lib"
+#elif [ -f ${op_script_dir}/../lib/op/op-common.sh ] ; then
+#    op_libdir="${op_script_dir}/../lib/op"
+#else
+#    echo "$0: op library not found or incorrect, panic" 2>&1
+#    exit 1
+#fi
+#source ${op_libdir}/op-common.sh
+
+main_domain=`hostname`
+templates_folder=.templates
+
+
+##
+## commons
+##
+
+## checks common
+
+check_fail() {
+    _checks_failed=1
+    echo "op: $@" >&2
+}
+
+ensure_checks_succeeded()
+{
+    if [ "$_checks_failed" == 1 ] ; then
+        echo "op: some precondiction checks failed, exit" >&2
+        exit 1
+    fi
+}
+
+maybe_default()
+{
+    local value="$1"
+
+    if [ -n "$value" ] ; then
+        echo "$value"
+    fi
+    local default="$2"
+    shift
+    shift
+
+    echo "op: using default '$default' as $*" >&2
+    echo "$default"
+}
+
+is_fqdn()
+{
+    [[ $1 =~ .*\.(com|pl|net|de) ]]
+}
+
+make_fqdn()
+{
+    echo "$1.$main_domain"
+}
+
+instantiate_site_template()
+{
+    local template_name="$1"
+    local folder="$2"
+
+    case "$template_name" in
+        placeholder)
+            my_sudo mkdir -p "$folder"
+            my_sudo chown -R "$site_owner_name:$site_owner_group" "$folder"
+            echo "<html><head>Hello</head><body>Hello world</body></html>" | tee "$folder/index.html" > /dev/null
+            ;;
+        git:*)
+            my_sudo mkdir -p "$folder"
+            my_sudo chown -R "$site_owner_name:$site_owner_group" "$folder"
+            repo="$(echo $template_name | sed -e 's/^git://')"
+            git clone "$repo" "$folder"
+            ;;
+        *)
+            if [ -d "$template_name" ] ; then
+                my_sudo cp -r "$template_name" "$folder"
+            elif [ -d "$templates_folder/$template_name" ] ; then
+                my_sudo cp -r "$templates_folder/$template_name" "$folder"
+            else
+                echo "op: template '$template_name' doesn't exist" >&2
+                return 1
+            fi
+            my_sudo chown -R "$site_owner_name:$site_owner_group" "$folder"
+            ;;
+    esac
+}
+
+##
+## checks app
+##
+
+check_site_unique()
+{
+    local site_name="$1"
+    local site_nginx_config="$nginx_all_conf_d_folder/$site_name"
+    if [ -f "$site_nginx_config" ] ; then
+        check_fail "$site_name already exists"
+        echo "sites already configured:" >&2
+        ls -al "$nginx_all_conf_d_folder" >&2
+        return 1
+    fi
+}
+
+check_folder_exists()
+{
+    if [ ! -d "$1" ] ; then
+        check_fail "folder '$1' doesn't exist"
+        return 1
+    fi
+}
+
+check_folder_doesnt_exist()
+{
+    if [ -d "$1" ] ; then
+        check_fail "folder '$1' already exist"
+        return 1
+    fi
+}
+
+my_sudo()
+{
+    if [ -n "$DRY_RUN" ] ; then
+        echo "op (dry-run): sudo $@" >&2
+        return 0
+    fi
+    echo "op: sudo $@" >&2
+    sudo "$@"
+}
+
+##
+## op 
+##
+
+op_init()
+{
+    #my_sudo groupadd op-sites
+    op_init_folders
+}
+
+op_init_folders()
+{
+    # target layout
+    # drwxrwxr-x 2 root op-sites 4096 Feb 25 11:30 /etc/op/nginx-all-conf.d
+    # drwxrwxr-x 2 root op-sites 4096 Jan 28 14:14 /etc/op/nginx-enabled-conf.d
+
+    my_sudo mkdir -p "$nginx_all_conf_d_folder" "$nginx_enabled_conf_d_folder"
+    my_sudo chown -R root:op-sites "$nginx_all_conf_d_folder" "$nginx_enabled_conf_d_folder"
+    my_sudo chmod -R g+ws "$nginx_all_conf_d_folder" "$nginx_enabled_conf_d_folder"
+}
+
+op_add_user_role()
+{
+    true
+}
+
+##
+## nginx static site
+##
+
+nginx_enabled_conf_d_folder="$config_root/etc/op/nginx-enabled-conf.d"
+nginx_all_conf_d_folder="$config_root/etc/op/nginx-all-conf.d"
+
+site_folders_root="/var/www"
+site_folders_user="$HOME/sites"
+
+nginx_create_site_int()
+{
+    local site_name="$1"
+    local site_nginx_config="$nginx_all_conf_d_folder/$site_name"
+
+    if ! is_fqdn $site_name ; then
+        check_fail "site name '$site_name' is not FQDN"
+        return
+    fi
+
+    check_site_unique "$site_name"
+    ensure_checks_succeeded
+
+    if [ ! -w "$nginx_conf_d_folder" ] ; then
+        echo "op: nginx conf folders do not exist, initializing" >&2
+        op_init_folders
+    fi
+
+    tee "$site_nginx_config" > /dev/null
+    nginx_enable_site "$site_name"
+}
+
+nginx_add_passenger_site()
+{
+    local site_name="$1"
+    local folder_name="$2"
+    local passenger_type="$3"
+
+    # check_value_in_set "$passenger_type" node
+
+    check_site_unique "$site_name"
+    check_folder_exists "$folder_name"
+    check_folder_exists "$folder_name/public"
+    ensure_checks_succeeded
+
+    nginx_create_site_int "$site_name" << EOF
+    server {
+        listen 80;
+        server_name $site_name;
+
+        location / {
+            include /etc/nginx/mime.types;
+            root $folder_name/public;
+            passenger_enabled on;
+            passenger_app_type ${passenger_type};
+        }
+    }
+EOF
+}
+
+nginx_add_static_site()
+{
+    local site_name="$1"
+    local folder_name="$2"
+
+    check_site_unique "$site_name"
+    check_folder_exists "$folder_name"
+    ensure_checks_succeeded
+
+    nginx_create_site_int "$site_name" << EOF
+    server {
+        listen 80;
+        server_name $site_name;
+
+        location / {
+            include /etc/nginx/mime.types;
+            root $folder_name;
+        }
+    }
+EOF
+}
+
+get_new_site_folder()
+{
+    if [ -w "$site_folders_root" ] ; then
+        echo "$site_folders_root/$1"
+    else
+        echo "$site_folders_user/$1"
+    fi
+}
+
+nginx_create_site_static()
+{
+    local site_name="$1"
+    local template_name="$2"
+    local site_folder="$(get_new_site_folder $site_name)"
+
+    check_folder_doesnt_exist "$site_folder"
+
+    check_site_unique "$site_name"
+    ensure_checks_succeeded
+
+    instantiate_site_template "$template_name" "$site_folder"
+    nginx_add_passenger_site "$site_name" "$site_folder"
+}
+
+nginx_create_site_passenger()
+{
+    local site_name="$1"
+    local template_name="$2"
+    local site_folder="$(get_new_site_folder $site_name)"
+    local passenger_type="$3"
+
+    check_folder_doesnt_exist "$site_folder"
+    check_site_unique "$site_name"
+    ensure_checks_succeeded
+
+    instantiate_site_template "$template_name" "$site_folder"
+    nginx_add_passenger_site "$site_name" "$site_folder" "$passenger_type"
+}
+
+nginx_enable_site()
+{
+    local site_name="$1"
+    local site_nginx_enabled_link="$nginx_enabled_conf_d_folder/$site_name"
+    local site_nginx_config="$nginx_all_conf_d_folder/$site_name"
+    ln -sf "$site_nginx_config" "$site_nginx_enabled_link"
+}
+
+nginx_disable_site()
+{
+    local site_name="$1"
+    local site_nginx_enabled_link="$nginx_enabled_conf_d_folder/$site_name"
+    rm -rf "$site_nginx_enabled_link"
+}
+
+nginx_remove_site()
+{
+    local site_name="$1"
+    local site_nginx_config="$nginx_all_conf_d_folder/$site_name"
+    nginx_disable_site "$site_name"
+    rm -rf "$site_nginx_config"
+
+}
+
+nginx_purge_site()
+{
+    local site_name="$1"
+    local site_nginx_config="$nginx_all_conf_d_folder/$site_name"
+    local site_folder="${2-$(get_new_site_folder "$1")}"
+    nginx_remove_site "$site_name"
+
+    if [ -z "$yes_i_really_want_to_purge_site" ] ; then
+        echo "op: to really purge site, set yes_i_really_want_to_purge_site=1 in environment" >&2
+        exit 1
+    fi
+    rm -rf "$site_folder" "$site_nginx_config"
+}
+
+nginx_reload()
+{
+    my_sudo service nginx reload
+}
+
+nginx_restart()
+{
+    my_sudo service nginx reload
+}
+
+site_exist()
+{
+    local site_name="$1"
+    local site_nginx_config="$nginx_all_conf_d_folder/$site_name"
+    test -f "$site_nginx_config"
+}
+
+while [ -n "$1" ] ; do
+    if   [ "$1" = "-h" -o "$1" = "--help" ]; then
+        usage
+        exit 0
+    elif [ "$1" = "-n" -o "$1" = "--dry-run" ] ; then
+        DRY_RUN=1
+        shift
+    elif [ "$1" = "-q" -o "$1" = "--quiet" ] ; then
+        QUIET=1
+        shift
+    else
+        if [ -z "$action" ] ; then
+            action="$1"
+            shift
+        else
+            args="$args $1"
+            shift
+        fi
+    fi
+done
+
+if [ -z "$action" ] ; then
+    echo "op: action not specified" >&2
+    exit 1
+fi
+
+if [ -n "$DRY_RUN" ] ; then
+    echo "op: dry-run mode; not executing any modyfying actions" >&2
+fi
+
+# -f -- don't expand globs
+set -f
+
+# reassign args as positional parameters
+set -- $args
+
+site_owner_name=`id -u`
+site_owner_group=`id -g`
+
+case "$action" in
+    help)
+        usage
+        ;;
+    list)
+        echo "# domain #state #type #root" >&2
+        for config_file in $(ls $nginx_all_conf_d_folder) ; do
+            site_name="$(basename $config_file)"
+            [ -e "$nginx_enabled_conf_d_folder/$site_name" ] && enabled=enabled || enabled=disabled
+            root="$(cat $nginx_all_conf_d_folder/$config_file | awk '/root/ { print $2 }'  | tr -d ';')"
+            passenger_type="$(cat $nginx_all_conf_d_folder/$config_file | awk '/passenger_app_type/ { print $2 }' | tr -d ';')"
+            [ -z "$passenger_type" ] && passenger_type=static
+            echo "$site_name $enabled $passenger_type $root"
+        done
+        ;;
+    site_enable)
+        site_name="$1"
+
+        if ! is_fqdn $site_name ; then
+            site_name="$(make_fqdn $site_name)"
+            echo "op: given site name is not FQDN, will work on actually: $site_name"
+        fi
+
+        if ! site_exist $site_name ; then
+            echo "op: site '$site_name'  not found"
+            exit 1
+        fi
+        nginx_enable_site "$site_name"
+        nginx_reload
+        ;;
+
+    site_disable)
+        site_name="$1"
+
+        if ! is_fqdn $site_name ; then
+            site_name="$(make_fqdn $site_name)"
+            echo "op: given site name is not FQDN, will work on actually: $site_name"
+        fi
+
+        if ! site_exist $site_name ; then
+            echo "op: site '$site_name' not found"
+            exit 1
+        fi
+        nginx_disable_site "$site_name"
+        nginx_reload
+        ;;
+
+    site_create)
+        site_type="$1"
+        site_name="$2"
+
+        if ! is_fqdn $site_name ; then
+            site_name="$(make_fqdn $site_name)"
+            echo "op: given site name is not FQDN, will create actually: $site_name"
+        fi
+
+        if site_exist $site_name ; then
+            echo "op: site '$site_name' already exists"
+            exit 1
+        fi
+
+        case "$site_type" in
+            static)
+                template_name="$(maybe_default "$3" placeholder template name)"
+
+                nginx_create_site_static "$site_name" "$template_name"
+                nginx_reload
+                ;;
+            node)
+                template_name="$(maybe_default "$3" git:https://github.com/phusion/passenger-nodejs-connect-demo.git template name)"
+                passenger_type="$(maybe_default "$4" node passenger app type)"
+                nginx_create_site_passenger "$site_name" "$template_name" "$passenger_type"
+                nginx_reload
+                ;;
+            *)
+                echo "op: invalid site type '$site_type'" >&2
+                ;;
+        esac
+        ;;
+    add_site)
+        site_type="$1"
+        site_name="$2"
+        site_folder="$3"
+
+        if ! is_fqdn $site_name ; then
+            site_name="$(make_fqdn $site_name)"
+            echo "op: given site name is not FQDN, will create actually: $site_name"
+        fi
+
+        if site_exist $site_name ; then
+            echo "op: site '$site_name' already exists"
+            exit 1
+        fi
+
+        case "$site_type" in
+            static)
+                nginx_add_static_site "$site_name" "$site_folder"
+                nginx_reload
+                ;;
+            node)
+                nginx_add_passenger_site "$site_name" "$site_folder"
+                nginx_reload
+                ;;
+            *)
+                echo "op: invalid site type '$site_type'" >&2
+                ;;
+        esac
+        ;;
+
+    site_remove)
+        site_name="$1"
+        if [ -z "$site_name" ] ; then
+            echo "op: site_name missing"
+            exit 1
+        fi
+        if ! is_fqdn $site_name ; then
+            site_name="$(make_fqdn $site_name)"
+            echo "op: given site name is not FQDN, will remove: $site_name"
+        fi
+        if [ ! -f "$nginx_all_conf_d_folder/$site_name" ] ; then
+            echo "op: cannot find site"
+            exit 1
+        fi
+        nginx_remove_site "$site_name"
+        ;;
+    init)
+        op_init
+        ;;
+    *)
+        echo "op: invalid action '$action'" >&2
+        usage
+        exit 1
+        ;;
+esac
+
+# jedit: :indent=4:tabSize=8:mode=shellscript:
+
